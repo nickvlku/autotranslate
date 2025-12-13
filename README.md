@@ -132,4 +132,4 @@ autotranslate video.mp4 --from ja --to en --whisper local --llm ollama
 
 ## License
 
-MIT
+GNU GENERAL PUBLIC LICENSE V3
