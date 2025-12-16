@@ -47,15 +47,20 @@ from .translate import translate
 )
 @click.option(
     "--llm",
-    type=click.Choice(["deepseek", "openai", "ollama"]),
+    type=click.Choice(["deepseek", "openai", "openrouter", "ollama"]),
     default="deepseek",
-    help="LLM provider for translation (openai uses GPT-5.2 by default)",
+    help="LLM provider for translation",
 )
 @click.option(
     "--whisper",
-    type=click.Choice(["cloud", "local"]),
-    default="cloud",
-    help="Whisper mode for transcription",
+    type=click.Choice(["openai", "groq", "openrouter", "local"]),
+    default="openai",
+    help="Transcription provider (openai, groq, openrouter, local)",
+)
+@click.option(
+    "--whisper-model",
+    default=None,
+    help="Whisper model (e.g., whisper-1, whisper-large-v3-turbo, large-v3)",
 )
 @click.option(
     "--ollama-model",
@@ -66,6 +71,11 @@ from .translate import translate
     "--openai-model",
     default="gpt-4o",
     help="OpenAI model for translation (gpt-5.2-chat-latest, gpt-5.2, gpt-4o)",
+)
+@click.option(
+    "--openrouter-model",
+    default="anthropic/claude-3.5-sonnet",
+    help="OpenRouter model for translation (e.g., anthropic/claude-3.5-sonnet, openai/gpt-4o)",
 )
 @click.option(
     "--cleanup",
@@ -87,8 +97,10 @@ def main(
     transcript: bool,
     llm: str,
     whisper: str,
+    whisper_model: str | None,
     ollama_model: str,
     openai_model: str,
+    openrouter_model: str,
     cleanup: bool,
     boost: float | None,
 ) -> None:
@@ -109,9 +121,21 @@ def main(
         raise click.ClickException("Cannot use both --audio and --transcript")
 
     # Validate API keys for selected providers
-    if not transcript and whisper == "cloud" and not config.has_openai():
+    if not transcript and whisper == "openai" and not config.has_openai():
         raise click.ClickException(
-            "OPENAI_API_KEY environment variable required for cloud Whisper. "
+            "OPENAI_API_KEY environment variable required for OpenAI Whisper. "
+            "Use --whisper local for offline mode."
+        )
+
+    if not transcript and whisper == "groq" and not config.has_groq():
+        raise click.ClickException(
+            "GROQ_API_KEY environment variable required for Groq Whisper. "
+            "Use --whisper local for offline mode."
+        )
+
+    if not transcript and whisper == "openrouter" and not config.has_openrouter():
+        raise click.ClickException(
+            "OPENROUTER_API_KEY environment variable required for OpenRouter transcription. "
             "Use --whisper local for offline mode."
         )
 
@@ -124,6 +148,12 @@ def main(
     if llm == "openai" and not config.has_openai():
         raise click.ClickException(
             "OPENAI_API_KEY environment variable required for OpenAI GPT-4o. "
+            "Use --llm ollama for offline mode."
+        )
+
+    if llm == "openrouter" and not config.has_openrouter():
+        raise click.ClickException(
+            "OPENROUTER_API_KEY environment variable required for OpenRouter. "
             "Use --llm ollama for offline mode."
         )
 
@@ -147,9 +177,20 @@ def main(
         base_name = input_p.stem
 
     # Determine model names for filenames
-    whisper_model_name = "whisper" if whisper == "cloud" else "whisper-local"
+    if whisper_model:
+        whisper_model_name = whisper_model.replace("/", "-")
+    elif whisper == "openai":
+        whisper_model_name = "whisper-1"
+    elif whisper == "groq":
+        whisper_model_name = "whisper-large-v3-turbo"
+    elif whisper == "openrouter":
+        whisper_model_name = "openai-whisper-1"
+    else:
+        whisper_model_name = "whisper-local"
     if llm == "openai":
         llm_model_name = openai_model
+    elif llm == "openrouter":
+        llm_model_name = openrouter_model.replace("/", "-")
     elif llm == "ollama":
         llm_model_name = ollama_model
     else:
@@ -205,8 +246,9 @@ def main(
             subtitles = transcribe(
                 audio_path,
                 config,
-                mode=whisper,
+                provider=whisper,
                 language=source_lang,
+                model=whisper_model,
                 on_progress=on_transcribe_progress,
             )
             click.echo(f"  Transcribed {len(subtitles)} segments")
@@ -231,6 +273,7 @@ def main(
             provider=llm,
             ollama_model=ollama_model,
             openai_model=openai_model,
+            openrouter_model=openrouter_model,
             on_progress=on_translate_progress,
         )
 
@@ -265,6 +308,8 @@ def main(
         llm_args = f"--llm {llm}"
         if llm == "openai":
             llm_args += f" --openai-model {openai_model}"
+        elif llm == "openrouter":
+            llm_args += f" --openrouter-model {openrouter_model}"
         elif llm == "ollama":
             llm_args += f" --ollama-model {ollama_model}"
 
@@ -275,8 +320,9 @@ def main(
         elif extracted_audio and audio_path:
             click.echo(f"Audio saved: {audio_path}")
             whisper_arg = f"--whisper {whisper}"
+            whisper_model_arg = f" --whisper-model {whisper_model}" if whisper_model else ""
             boost_arg = f" --boost {boost}" if boost else ""
-            click.echo(f"Retry from audio: autotranslate {audio_path} --audio --from {source_lang} --to {target_lang} {whisper_arg}{boost_arg} {llm_args}")
+            click.echo(f"Retry from audio: autotranslate {audio_path} --audio --from {source_lang} --to {target_lang} {whisper_arg}{whisper_model_arg}{boost_arg} {llm_args}")
 
         sys.exit(1)
 

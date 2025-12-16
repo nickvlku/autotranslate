@@ -2,6 +2,7 @@
 
 import json
 import re
+import sys
 import time
 
 import ollama
@@ -53,13 +54,20 @@ def _fix_json(text: str) -> str:
     # Remove markdown code blocks
     text = re.sub(r'^```json\s*', '', text, flags=re.MULTILINE)
     text = re.sub(r'^```\s*$', '', text, flags=re.MULTILINE)
+    text = text.strip()
 
-    # Find the JSON array
+    # Find the JSON array - first try complete array
     match = re.search(r'\[.*\]', text, re.DOTALL)
-    if not match:
-        raise ValueError("Could not find JSON array in response")
-
-    json_str = match.group()
+    if match:
+        json_str = match.group()
+    else:
+        # Handle truncated response - try to salvage what we can
+        if '[' in text:
+            json_str = text[text.index('['):]
+            # Try to close truncated JSON properly
+            json_str = _close_truncated_json(json_str)
+        else:
+            raise ValueError("Could not find JSON array in response")
 
     # Fix common issues
     # 1. Trailing commas before ] or }
@@ -83,6 +91,21 @@ def _fix_json(text: str) -> str:
     return json_str
 
 
+def _close_truncated_json(json_str: str) -> str:
+    """Attempt to close truncated JSON by keeping only complete entries."""
+    # Find all complete objects in the array
+    complete_objects = []
+    pattern = r'\{\s*"index"\s*:\s*(\d+)\s*,\s*"text"\s*:\s*"([^"]*(?:\\.[^"]*)*)"\s*\}'
+
+    for match in re.finditer(pattern, json_str):
+        complete_objects.append(match.group(0))
+
+    if not complete_objects:
+        raise ValueError("Could not extract any complete entries from truncated response")
+
+    return '[' + ', '.join(complete_objects) + ']'
+
+
 def _parse_translation_response(response: str, original_subs: list[Subtitle]) -> list[Subtitle]:
     """Parse LLM translation response and merge with original subtitles."""
     try:
@@ -93,6 +116,18 @@ def _parse_translation_response(response: str, original_subs: list[Subtitle]) ->
 
     # Create lookup by index
     trans_by_index = {t["index"]: t["text"] for t in translated}
+
+    # Check for partial results
+    expected_indices = {sub.index for sub in original_subs}
+    received_indices = set(trans_by_index.keys())
+    missing_indices = expected_indices - received_indices
+
+    if missing_indices:
+        print(
+            f"  Warning: Recovered {len(received_indices)}/{len(expected_indices)} "
+            f"entries from truncated response",
+            file=sys.stderr
+        )
 
     result = []
     for sub in original_subs:
@@ -254,6 +289,78 @@ def translate_openai(
     return translated
 
 
+def _translate_batch_openrouter(
+    client: OpenAI,
+    batch: list[Subtitle],
+    source_lang: str,
+    target_lang: str,
+    model: str,
+) -> list[Subtitle]:
+    """Translate a single batch using OpenRouter with retry logic."""
+    input_data = [{"index": s.index, "text": s.text} for s in batch]
+
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": TRANSLATION_SYSTEM_PROMPT.format(
+                            source_lang=source_lang, target_lang=target_lang
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(input_data, ensure_ascii=False)},
+                ],
+                temperature=0.3,
+            )
+
+            result_text = response.choices[0].message.content
+            return _parse_translation_response(result_text, batch)
+
+        except ValueError as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+                continue
+            raise
+
+    raise last_error
+
+
+def translate_openrouter(
+    subtitles: list[Subtitle],
+    config: Config,
+    source_lang: str,
+    target_lang: str,
+    model: str = "anthropic/claude-3.5-sonnet",
+    on_progress: callable = None,
+) -> list[Subtitle]:
+    """Translate subtitles using OpenRouter API."""
+    if not config.openrouter_api_key:
+        raise RuntimeError("OpenRouter API key not configured")
+
+    client = OpenAI(
+        api_key=config.openrouter_api_key,
+        base_url=config.openrouter_base_url,
+    )
+
+    batches = _batch_subtitles(subtitles)
+    translated = []
+
+    for i, batch in enumerate(batches):
+        if on_progress:
+            on_progress(i + 1, len(batches))
+
+        batch_translated = _translate_batch_openrouter(
+            client, batch, source_lang, target_lang, model
+        )
+        translated.extend(batch_translated)
+
+    return translated
+
+
 def _translate_batch_ollama(
     batch: list[Subtitle],
     source_lang: str,
@@ -347,6 +454,7 @@ def translate(
     provider: str = "deepseek",
     ollama_model: str = "llama3.1:8b",
     openai_model: str = "gpt-5.2-chat-latest",
+    openrouter_model: str = "anthropic/claude-3.5-sonnet",
     on_progress: callable = None,
 ) -> list[Subtitle]:
     """Translate subtitles using specified provider."""
@@ -357,6 +465,8 @@ def translate(
         return translate_deepseek(subtitles, config, source_name, target_name, on_progress)
     elif provider == "openai":
         return translate_openai(subtitles, config, source_name, target_name, openai_model, on_progress)
+    elif provider == "openrouter":
+        return translate_openrouter(subtitles, config, source_name, target_name, openrouter_model, on_progress)
     elif provider == "ollama":
         return translate_ollama(subtitles, source_name, target_name, ollama_model, on_progress)
     else:
