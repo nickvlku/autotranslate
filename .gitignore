@@ -13,3 +13,8 @@ wheels/
 .env
 .env.*
 !.env.example
+
+# Generated outputs (transcripts, translations, extracted audio)
+*.srt
+*.wav
+*.aiff
