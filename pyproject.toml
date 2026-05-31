@@ -14,6 +14,13 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+# Local Qwen3-ASR transcription (`--whisper qwen-asr`). Heavy (pulls in torch),
+# so it is opt-in: `pip install -e ".[qwen]"` or `uv sync --extra qwen`.
+qwen = [
+    "qwen-asr>=0.0.6",
+]
+
 [project.scripts]
 autotranslate = "autotranslate.cli:main"
 

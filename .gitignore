@@ -14,7 +14,8 @@ wheels/
 .env.*
 !.env.example
 
-# Generated outputs (transcripts, translations, extracted audio)
+# Generated outputs (transcripts, translations, extracted audio, muxed video)
 *.srt
 *.wav
 *.aiff
+*.subbed.*

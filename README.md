@@ -5,9 +5,10 @@ A CLI tool that translates video/audio to subtitles in another language. It extr
 ## Features
 
 - **Audio extraction** from video files using ffmpeg
-- **Transcription** via OpenAI Whisper, Groq, OpenRouter, faster-whisper (local), or whisper-cli (local whisper.cpp)
+- **Transcription** via OpenAI Whisper, Groq, OpenRouter, faster-whisper (local), whisper-cli (local whisper.cpp), or Qwen3-ASR (local, with forced-aligner timestamps)
 - **Translation** using DeepSeek, OpenAI, OpenRouter, or Ollama (local)
 - **SRT output** with proper timestamps
+- **Embed subtitles** back into the video as soft subtitle tracks (`--embed`)
 - Automatic chunking for large audio files
 - Audio volume boost for quiet content
 - Resume from intermediate files if processing fails
@@ -31,6 +32,10 @@ uv sync
 
 # Or install with pip
 pip install -e .
+
+# Optional: local Qwen3-ASR transcription (--whisper qwen-asr). Heavy (pulls in
+# torch + ~4.6 GB of models on first run). Runs on Apple Silicon (MPS) or CPU.
+uv sync --extra qwen      # or: pip install -e ".[qwen]"
 ```
 
 ## Configuration
@@ -88,8 +93,9 @@ Input Options:
   --transcript, -t        Treat input as SRT (skip extraction and transcription)
 
 Provider Options:
-  --whisper [openai|groq|openrouter|local|whisper-cli]
-                          Transcription provider (default: openai)
+  --whisper [openai|groq|openrouter|local|whisper-cli|qwen-asr]
+                          Transcription provider (default: openai). qwen-asr is
+                          local Qwen3-ASR + forced aligner (needs the [qwen] extra)
   --whisper-model TEXT    Whisper model: an API model name (e.g. whisper-1,
                           whisper-large-v3-turbo, large-v3), or for
                           --whisper whisper-cli a ggml model file path
@@ -113,6 +119,11 @@ Provider Options:
 Output Options:
   --output, -o PATH       Output SRT file path
   --cleanup               Delete intermediate files on success
+  --embed                 Embed the subtitle track(s) into the source video as
+                          a new <name>.subbed.<ext> file (soft subs, no
+                          re-encode). Two tracks are added (source transcript +
+                          target translation), each titled "Language (model)".
+                          Video input only.
 
 Audio Options:
   --boost FLOAT           Boost audio volume in dB (e.g., 10 for +10dB)
@@ -130,6 +141,10 @@ autotranslate video.mp4 --from ja --to en --whisper whisper-cli --whisper-model 
 # whisper-cli with Voice Activity Detection (filters non-speech)
 autotranslate video.mp4 --from ja --to en --whisper whisper-cli \
   --whisper-model ./ggml-large-v3.bin --vad-model ./ggml-silero-v6.2.0.bin
+
+# Local Qwen3-ASR (requires the [qwen] extra). Word-level timestamps from the
+# forced aligner are grouped into cues at sentence boundaries. Runs on MPS/CPU.
+autotranslate video.mp4 --from ja --to en --whisper qwen-asr
 
 # Use Groq for fast transcription and OpenRouter for translation
 autotranslate video.mp4 --from ja --to en --whisper groq --llm openrouter
@@ -155,6 +170,15 @@ autotranslate video.mp4 --from ja --to en --boost 10
 
 # Clean up intermediate files after successful translation
 autotranslate video.mp4 --from ja --to en --cleanup
+
+# Embed the subtitles back into the video (creates video.subbed.mp4)
+autotranslate video.mp4 --from ja --to en --embed
+
+# Bake off several models: one translation (SRT + subtitle track) per model.
+# Progressive - if one model fails, the others still complete and get embedded.
+autotranslate video.mp4 --from ja --to en --embed \
+  --llm openai --openai-base-url http://localhost:1234/v1 \
+  --openai-model "model-a,model-b,model-c"
 ```
 
 ### Supported Languages
@@ -172,6 +196,13 @@ For example:
 - `video.whisper-1.ja.srt` - OpenAI Whisper transcription
 - `video.deepseek.en.srt` - DeepSeek translation
 - `video.gpt-4o.en.srt` - GPT-4o translation
+
+With `--embed`, a `{name}.subbed.{ext}` video is also written, containing one
+soft subtitle track per successful model (plus the source transcript), each
+titled `Language (model)`. Video and audio are stream-copied (no re-encode); the
+track title is stored as the MP4 track `name` (or MKV `title`) that players
+display. During a multi-model bake-off the file is re-muxed and atomically
+replaced after each model, so an interrupted run never loses finished tracks.
 
 If processing fails, the tool shows a command to retry from the last successful step.
 

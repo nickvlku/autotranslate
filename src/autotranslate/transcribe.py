@@ -386,6 +386,12 @@ def transcribe_whisper_cli(
     language: str | None = None,
     model: str | None = None,
     vad_model: str | None = None,
+    vad_threshold: float = 0.5,
+    vad_min_speech_duration_ms: float = 250,
+    vad_min_silence_duration_ms: float = 100,
+    vad_max_speech_duration_s: float = 0,
+    vad_speech_pad_ms: float = 30,
+    vad_samples_overlap: float = 0.1,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[Subtitle]:
     """Transcribe audio using the local whisper-cli binary (whisper.cpp).
@@ -402,6 +408,12 @@ def transcribe_whisper_cli(
         model: Path to the ggml model file (required; passed to whisper-cli -m)
         vad_model: Optional path to a VAD model file (e.g. ggml-silero-*.bin);
             when given, enables Voice Activity Detection via "--vad --vad-model"
+        vad_threshold: VAD threshold for speech recognition (0.0-1.0)
+        vad_min_speech_duration_ms: VAD min speech duration in ms
+        vad_min_silence_duration_ms: VAD min silence duration in ms
+        vad_max_speech_duration_s: VAD max speech duration in seconds (0 = unlimited)
+        vad_speech_pad_ms: VAD speech padding in ms
+        vad_samples_overlap: VAD samples overlap in seconds
         on_progress: Optional callback(step, total); called once as (1, 1)
 
     Returns:
@@ -433,7 +445,17 @@ def transcribe_whisper_cli(
         vad_model_path = Path(vad_model)
         if not vad_model_path.is_file():
             raise RuntimeError(f"whisper-cli VAD model file not found: {vad_model_path}")
-        vad_args = ["--vad", "--vad-model", str(vad_model_path)]
+        vad_args = [
+            "--vad",
+            "--vad-model", str(vad_model_path),
+            "--vad-threshold", str(vad_threshold),
+            "--vad-min-speech-duration-ms", str(vad_min_speech_duration_ms),
+            "--vad-min-silence-duration-ms", str(vad_min_silence_duration_ms),
+            "--vad-speech-pad-ms", str(vad_speech_pad_ms),
+            "--vad-samples-overlap", str(vad_samples_overlap),
+        ]
+        if vad_max_speech_duration_s > 0:
+            vad_args.extend(["--vad-max-speech-duration-s", str(vad_max_speech_duration_s)])
 
     if on_progress:
         on_progress(1, 1)
@@ -469,6 +491,186 @@ def transcribe_whisper_cli(
         return read_srt(srt_path)
 
 
+# Languages the Qwen3 forced aligner supports, keyed by 2-letter source code.
+# Unknown codes fall back to None (auto-detect).
+QWEN_LANGUAGES = {
+    "zh": "Chinese", "en": "English", "yue": "Cantonese", "fr": "French",
+    "de": "German", "it": "Italian", "ja": "Japanese", "ko": "Korean",
+    "pt": "Portuguese", "ru": "Russian", "es": "Spanish",
+}
+
+# Characters that end a subtitle cue (CJK + Latin sentence terminators).
+_SENTENCE_END = set("。！？!?.…")
+
+
+def _group_aligned_items(
+    items: list,
+    full_text: str,
+    max_cue_duration: float,
+    max_cue_chars: int,
+) -> list[tuple[str, float, float]]:
+    """Group word/morpheme-level aligned items into subtitle cues.
+
+    The Qwen forced aligner returns fine-grained items (text + start/end), and
+    ``full_text`` is the transcript including punctuation that the items omit.
+    We map each item back to its span in ``full_text`` to recover trailing
+    punctuation, then close a cue on a sentence terminator OR when the cue hits
+    the duration / length cap (hybrid grouping).
+
+    Returns a list of ``(text, start, end)`` cues.
+    """
+    # Locate each item's text in full_text so we can include trailing punctuation.
+    spans: list[tuple[int, int] | None] = []
+    cursor = 0
+    for it in items:
+        idx = full_text.find(it.text, cursor) if it.text else -1
+        if idx == -1:
+            spans.append(None)
+        else:
+            spans.append((idx, idx + len(it.text)))
+            cursor = idx + len(it.text)
+
+    n = len(items)
+    cues: list[tuple[str, float, float]] = []
+    cur_text = ""
+    cur_start: float | None = None
+    cur_end: float | None = None
+
+    for i, it in enumerate(items):
+        if cur_start is None:
+            cur_start = it.start_time
+
+        # Display segment: from this item's start to the next located item's
+        # start, so trailing punctuation/spaces stay attached to this item.
+        if spans[i] is not None:
+            seg_start = spans[i][0]
+            seg_end = len(full_text)
+            for j in range(i + 1, n):
+                if spans[j] is not None:
+                    seg_end = spans[j][0]
+                    break
+            seg = full_text[seg_start:seg_end]
+        else:
+            seg = it.text or ""
+
+        cur_text += seg
+        cur_end = it.end_time
+
+        ends_sentence = any(c in _SENTENCE_END for c in seg)
+        too_long = (
+            (cur_end - cur_start) >= max_cue_duration
+            or len(cur_text.strip()) >= max_cue_chars
+        )
+        if ends_sentence or too_long:
+            text = cur_text.strip()
+            if text:
+                cues.append((text, cur_start, cur_end))
+            cur_text = ""
+            cur_start = None
+            cur_end = None
+
+    if cur_text.strip() and cur_start is not None:
+        cues.append((cur_text.strip(), cur_start, cur_end))
+
+    return cues
+
+
+def transcribe_qwen_asr(
+    audio_path: str | Path,
+    language: str | None = None,
+    model: str | None = None,
+    aligner: str = "Qwen/Qwen3-ForcedAligner-0.6B",
+    on_progress: Callable[[int, int], None] | None = None,
+    max_cue_duration: float = 6.0,
+    max_cue_chars: int = 40,
+) -> list[Subtitle]:
+    """Transcribe audio locally with Qwen3-ASR + the Qwen3 forced aligner.
+
+    Qwen3-ASR produces only a flat transcript, so the forced aligner supplies
+    word/character-level timestamps, which we group into subtitle cues. Runs on
+    Apple Silicon (MPS) or CPU. The aligner caps at ~5 minutes, so audio is
+    split into <5-minute chunks and timestamps are offset per chunk.
+
+    Args:
+        audio_path: Path to the audio file (wav/mp3/flac/...)
+        language: Optional source language code (e.g. "ja"); mapped to the
+            aligner's language name, or auto-detected if unknown/None
+        model: ASR model repo id (default Qwen/Qwen3-ASR-1.7B)
+        aligner: Forced aligner repo id (provides timestamps)
+        on_progress: Optional callback(chunk_num, total_chunks)
+        max_cue_duration: Max seconds per subtitle cue before forcing a split
+        max_cue_chars: Max characters per cue before forcing a split
+
+    Returns:
+        List of Subtitle objects with timestamps
+
+    Raises:
+        RuntimeError: if the qwen-asr package is not installed or inference fails
+    """
+    try:
+        import torch
+        from qwen_asr import Qwen3ASRModel
+    except ImportError as e:
+        raise RuntimeError(
+            "qwen-asr is not installed. Install the optional extra with "
+            "`pip install 'autotranslate[qwen]'` (or `pip install qwen-asr`)."
+        ) from e
+
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    dtype = torch.float16 if device == "mps" else torch.float32
+
+    asr = Qwen3ASRModel.from_pretrained(
+        model or "Qwen/Qwen3-ASR-1.7B",
+        forced_aligner=aligner,
+        forced_aligner_kwargs={"dtype": dtype, "device_map": device},
+        max_new_tokens=1024,
+        dtype=dtype,
+        device_map=device,
+    )
+
+    lang_name = QWEN_LANGUAGES.get(language.lower()) if language else None
+
+    # Keep each chunk under the aligner's ~5-minute limit.
+    chunks = split_audio(audio_path, chunk_duration=270.0)
+    subtitles: list[Subtitle] = []
+    time_offset = 0.0
+    index = 1
+
+    try:
+        for i, chunk in enumerate(chunks):
+            if on_progress:
+                on_progress(i + 1, len(chunks))
+
+            result = asr.transcribe(
+                str(chunk), language=lang_name, return_time_stamps=True
+            )[0]
+            items = list(result.time_stamps) if result.time_stamps is not None else []
+            cues = _group_aligned_items(
+                items, result.text or "", max_cue_duration, max_cue_chars
+            )
+            for text, start, end in cues:
+                subtitles.append(
+                    Subtitle(
+                        index=index,
+                        start=start + time_offset,
+                        end=end + time_offset,
+                        text=text,
+                    )
+                )
+                index += 1
+
+            time_offset += get_audio_duration(chunk)
+    finally:
+        for chunk in chunks:
+            if Path(chunk) != Path(audio_path):
+                try:
+                    os.unlink(chunk)
+                except OSError:
+                    pass
+
+    return subtitles
+
+
 def transcribe(
     audio_path: str | Path,
     config: Config,
@@ -476,6 +678,12 @@ def transcribe(
     language: str | None = None,
     model: str | None = None,
     vad_model: str | None = None,
+    vad_threshold: float = 0.5,
+    vad_min_speech_duration_ms: float = 250,
+    vad_min_silence_duration_ms: float = 100,
+    vad_max_speech_duration_s: float = 0,
+    vad_speech_pad_ms: float = 30,
+    vad_samples_overlap: float = 0.1,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[Subtitle]:
     """Transcribe audio using specified provider.
@@ -483,10 +691,16 @@ def transcribe(
     Args:
         audio_path: Path to the audio file
         config: Application configuration
-        provider: "openai", "groq", "openrouter", "local", or "whisper-cli"
+        provider: "openai", "groq", "openrouter", "local", "whisper-cli", or "qwen-asr"
         language: Optional source language code
         model: Optional model name (provider-specific defaults if not specified)
         vad_model: Optional VAD model file path (whisper-cli provider only)
+        vad_threshold: VAD threshold (whisper-cli only)
+        vad_min_speech_duration_ms: VAD min speech duration ms (whisper-cli only)
+        vad_min_silence_duration_ms: VAD min silence duration ms (whisper-cli only)
+        vad_max_speech_duration_s: VAD max speech duration s (whisper-cli only)
+        vad_speech_pad_ms: VAD speech padding ms (whisper-cli only)
+        vad_samples_overlap: VAD samples overlap s (whisper-cli only)
         on_progress: Optional callback(chunk_num, total_chunks)
 
     Returns:
@@ -507,6 +721,14 @@ def transcribe(
     elif provider == "local":
         return transcribe_local(audio_path, language, model or "large-v3")
     elif provider == "whisper-cli":
-        return transcribe_whisper_cli(audio_path, language, model, vad_model, on_progress)
+        return transcribe_whisper_cli(
+            audio_path, language, model, vad_model,
+            vad_threshold, vad_min_speech_duration_ms,
+            vad_min_silence_duration_ms, vad_max_speech_duration_s,
+            vad_speech_pad_ms, vad_samples_overlap,
+            on_progress,
+        )
+    elif provider == "qwen-asr":
+        return transcribe_qwen_asr(audio_path, language, model, on_progress=on_progress)
     else:
         raise ValueError(f"Unknown transcription provider: {provider}")
