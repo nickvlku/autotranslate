@@ -49,8 +49,36 @@ def _batch_subtitles(subtitles: list[Subtitle], max_chars: int = 3000) -> list[l
     return batches
 
 
+def _strip_reasoning(text: str) -> str:
+    """Strip reasoning/thinking sections some models emit before the answer.
+
+    Local "thinking" models often prepend their chain-of-thought to the
+    content itself (rather than a separate reasoning field), which defeats JSON
+    extraction because the reasoning contains example arrays. The real answer
+    always follows the reasoning, so we drop:
+
+    - ``<think>...</think>`` blocks (common convention), and
+    - channel-style thought wrappers, keeping only the text after the final
+      channel marker (e.g. ``<|channel>thought ... <channel|>ANSWER``).
+
+    Responses with no such markers are returned unchanged (modulo whitespace),
+    so this is a no-op for the cloud providers that already return clean JSON.
+    """
+    # Remove <think>...</think> reasoning blocks.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Channel-style wrappers emit the answer after the final channel marker;
+    # the regex matches <|channel>, <channel|>, and <|channel|>.
+    markers = list(re.finditer(r"<\|?channel\|?>", text, flags=re.IGNORECASE))
+    if markers:
+        text = text[markers[-1].end():]
+    return text.strip()
+
+
 def _fix_json(text: str) -> str:
     """Attempt to fix common JSON issues from LLM output."""
+    # Drop any chain-of-thought a "thinking" model prepended to the answer.
+    text = _strip_reasoning(text)
+
     # Remove markdown code blocks
     text = re.sub(r'^```json\s*', '', text, flags=re.MULTILINE)
     text = re.sub(r'^```\s*$', '', text, flags=re.MULTILINE)
@@ -220,6 +248,7 @@ def _translate_batch_openai(
     source_lang: str,
     target_lang: str,
     model: str = "gpt-5.2-chat-latest",
+    extra_body: dict | None = None,
 ) -> list[Subtitle]:
     """Translate a single batch using OpenAI with retry logic."""
     input_data = [{"index": s.index, "text": s.text} for s in batch]
@@ -244,6 +273,11 @@ def _translate_batch_openai(
             }
             if not is_gpt5:
                 kwargs["temperature"] = 0.3
+            # Pass through arbitrary request-body params (e.g. for an
+            # OpenAI-compatible server like LM Studio):
+            # {"chat_template_kwargs": {"enable_thinking": false}}
+            if extra_body:
+                kwargs["extra_body"] = extra_body
 
             response = client.chat.completions.create(**kwargs)
 
@@ -272,7 +306,7 @@ def translate_openai(
     if not config.openai_api_key:
         raise RuntimeError("OpenAI API key not configured")
 
-    client = OpenAI(api_key=config.openai_api_key)
+    client = OpenAI(api_key=config.openai_api_key, base_url=config.openai_base_url)
 
     batches = _batch_subtitles(subtitles)
     translated = []
@@ -282,7 +316,8 @@ def translate_openai(
             on_progress(i + 1, len(batches))
 
         batch_translated = _translate_batch_openai(
-            client, batch, source_lang, target_lang, model
+            client, batch, source_lang, target_lang, model,
+            extra_body=config.openai_extra_body,
         )
         translated.extend(batch_translated)
 

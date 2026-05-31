@@ -11,6 +11,8 @@ class Config:
     """Application configuration loaded from environment."""
 
     openai_api_key: str | None = None
+    openai_base_url: str | None = None
+    openai_extra_body: dict | None = None
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     openrouter_api_key: str | None = None
@@ -24,6 +26,7 @@ class Config:
         load_dotenv()
         return cls(
             openai_api_key=os.getenv("OPENAI_API_KEY"),
+            openai_base_url=os.getenv("OPENAI_BASE_URL"),
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY"),
             deepseek_base_url=os.getenv(
                 "DEEPSEEK_BASE_URL", "https://api.deepseek.com"

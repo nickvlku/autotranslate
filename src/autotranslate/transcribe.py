@@ -4,6 +4,9 @@ import base64
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Callable
 
@@ -12,6 +15,7 @@ from openai import OpenAI
 from .audio import get_audio_duration, needs_chunking, split_audio
 from .config import Config
 from .models import Subtitle
+from .srt import read_srt
 
 
 # Models that use the Whisper transcription API (not chat completions)
@@ -293,7 +297,7 @@ def transcribe_openai(
     if not config.openai_api_key:
         raise RuntimeError("OpenAI API key not configured")
 
-    client = OpenAI(api_key=config.openai_api_key)
+    client = OpenAI(api_key=config.openai_api_key, base_url=config.openai_base_url)
 
     if _is_whisper_model(model):
         return _transcribe_with_chunking(Path(audio_path), client, model, language, on_progress)
@@ -377,12 +381,101 @@ def transcribe_local(
     return subtitles
 
 
+def transcribe_whisper_cli(
+    audio_path: str | Path,
+    language: str | None = None,
+    model: str | None = None,
+    vad_model: str | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> list[Subtitle]:
+    """Transcribe audio using the local whisper-cli binary (whisper.cpp).
+
+    Shells out to ``whisper-cli``, which must be installed and on PATH. The
+    model is a ggml model file passed via ``-m`` (e.g. ``ggml-large-v3.bin``).
+    Output is written as SRT and parsed back into Subtitle objects, which
+    preserves the per-segment timestamps. Runs locally, so there is no API
+    size limit and no chunking.
+
+    Args:
+        audio_path: Path to the audio file (wav/mp3/ogg/flac)
+        language: Optional source language code (e.g. "ja", "en"); "auto" detects
+        model: Path to the ggml model file (required; passed to whisper-cli -m)
+        vad_model: Optional path to a VAD model file (e.g. ggml-silero-*.bin);
+            when given, enables Voice Activity Detection via "--vad --vad-model"
+        on_progress: Optional callback(step, total); called once as (1, 1)
+
+    Returns:
+        List of Subtitle objects with timestamps
+
+    Raises:
+        RuntimeError: if the model is missing, whisper-cli is not on PATH, a
+            model file does not exist, or transcription fails
+    """
+    if not model:
+        raise RuntimeError(
+            "whisper-cli requires a model file. Pass --whisper-model "
+            "/path/to/ggml-<size>.bin (a whisper.cpp ggml model)."
+        )
+
+    binary = shutil.which("whisper-cli")
+    if binary is None:
+        raise RuntimeError(
+            "whisper-cli not found on PATH. Install whisper.cpp and ensure the "
+            "'whisper-cli' binary is available."
+        )
+
+    model_path = Path(model)
+    if not model_path.is_file():
+        raise RuntimeError(f"whisper-cli model file not found: {model_path}")
+
+    vad_args: list[str] = []
+    if vad_model:
+        vad_model_path = Path(vad_model)
+        if not vad_model_path.is_file():
+            raise RuntimeError(f"whisper-cli VAD model file not found: {vad_model_path}")
+        vad_args = ["--vad", "--vad-model", str(vad_model_path)]
+
+    if on_progress:
+        on_progress(1, 1)
+
+    # whisper-cli writes "<prefix>.srt"; use a temp prefix we control so the
+    # SRT is cleaned up automatically once we've parsed it.
+    audio_path = Path(audio_path)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        out_prefix = Path(tmp_dir) / "transcript"
+        cmd = [
+            binary,
+            "-m", str(model_path),
+            "-f", str(audio_path),
+            "-l", language or "auto",
+            "-osrt",
+            "-of", str(out_prefix),
+            "-np",  # suppress prints other than results
+            *vad_args,
+        ]
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"whisper-cli failed: {e.stderr or e.stdout}"
+            ) from e
+
+        srt_path = out_prefix.with_suffix(".srt")
+        if not srt_path.is_file():
+            raise RuntimeError(
+                f"whisper-cli did not produce an SRT file at {srt_path}"
+            )
+        return read_srt(srt_path)
+
+
 def transcribe(
     audio_path: str | Path,
     config: Config,
     provider: str = "openai",
     language: str | None = None,
     model: str | None = None,
+    vad_model: str | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[Subtitle]:
     """Transcribe audio using specified provider.
@@ -390,9 +483,10 @@ def transcribe(
     Args:
         audio_path: Path to the audio file
         config: Application configuration
-        provider: "openai", "groq", "openrouter", or "local"
+        provider: "openai", "groq", "openrouter", "local", or "whisper-cli"
         language: Optional source language code
         model: Optional model name (provider-specific defaults if not specified)
+        vad_model: Optional VAD model file path (whisper-cli provider only)
         on_progress: Optional callback(chunk_num, total_chunks)
 
     Returns:
@@ -412,5 +506,7 @@ def transcribe(
         )
     elif provider == "local":
         return transcribe_local(audio_path, language, model or "large-v3")
+    elif provider == "whisper-cli":
+        return transcribe_whisper_cli(audio_path, language, model, vad_model, on_progress)
     else:
         raise ValueError(f"Unknown transcription provider: {provider}")

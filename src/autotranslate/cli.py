@@ -1,5 +1,6 @@
 """CLI entry point for autotranslate."""
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -53,14 +54,21 @@ from .translate import translate
 )
 @click.option(
     "--whisper",
-    type=click.Choice(["openai", "groq", "openrouter", "local"]),
+    type=click.Choice(["openai", "groq", "openrouter", "local", "whisper-cli"]),
     default="openai",
-    help="Transcription provider (openai, groq, openrouter, local)",
+    help="Transcription provider (openai, groq, openrouter, local, whisper-cli)",
 )
 @click.option(
     "--whisper-model",
     default=None,
-    help="Whisper model (e.g., whisper-1, whisper-large-v3-turbo, large-v3)",
+    help="Whisper model: an API model name (e.g. whisper-1, large-v3), or for "
+    "--whisper whisper-cli a ggml model file path (e.g. ./ggml-large-v3.bin)",
+)
+@click.option(
+    "--vad-model",
+    default=None,
+    help="whisper-cli only: enable Voice Activity Detection using this VAD model "
+    "file (e.g. ./ggml-silero-v6.2.0.bin); passed as --vad --vad-model",
 )
 @click.option(
     "--ollama-model",
@@ -71,6 +79,20 @@ from .translate import translate
     "--openai-model",
     default="gpt-4o",
     help="OpenAI model for translation (gpt-5.2-chat-latest, gpt-5.2, gpt-4o)",
+)
+@click.option(
+    "--openai-base-url",
+    default=None,
+    help="Override the OpenAI-compatible API base URL for the openai provider "
+    "(translation and transcription), e.g. http://localhost:1234/v1 for LM "
+    "Studio. Takes precedence over the OPENAI_BASE_URL env var.",
+)
+@click.option(
+    "--openai-extra-body",
+    default=None,
+    help="Extra JSON merged into openai translation request bodies, for "
+    "OpenAI-compatible servers. E.g. to disable thinking on models that "
+    'support it: \'{"chat_template_kwargs": {"enable_thinking": false}}\'',
 )
 @click.option(
     "--openrouter-model",
@@ -98,8 +120,11 @@ def main(
     llm: str,
     whisper: str,
     whisper_model: str | None,
+    vad_model: str | None,
     ollama_model: str,
     openai_model: str,
+    openai_base_url: str | None,
+    openai_extra_body: str | None,
     openrouter_model: str,
     cleanup: bool,
     boost: float | None,
@@ -115,6 +140,18 @@ def main(
       autotranslate transcript.ja.srt --transcript --from ja --to en
     """
     config = Config.from_env()
+
+    # CLI flag overrides the OPENAI_BASE_URL env var (which from_env already read)
+    if openai_base_url:
+        config.openai_base_url = openai_base_url
+
+    if openai_extra_body:
+        try:
+            config.openai_extra_body = json.loads(openai_extra_body)
+        except json.JSONDecodeError as e:
+            raise click.ClickException(f"--openai-extra-body must be valid JSON: {e}")
+        if not isinstance(config.openai_extra_body, dict):
+            raise click.ClickException("--openai-extra-body must be a JSON object")
 
     # Validate flags
     if audio and transcript:
@@ -137,6 +174,17 @@ def main(
         raise click.ClickException(
             "OPENROUTER_API_KEY environment variable required for OpenRouter transcription. "
             "Use --whisper local for offline mode."
+        )
+
+    if not transcript and whisper == "whisper-cli" and not whisper_model:
+        raise click.ClickException(
+            "--whisper-model is required for whisper-cli: pass the ggml model "
+            "file path, e.g. --whisper-model /path/to/ggml-large-v3.bin"
+        )
+
+    if vad_model and whisper != "whisper-cli":
+        raise click.ClickException(
+            "--vad-model is only supported with --whisper whisper-cli"
         )
 
     if llm == "deepseek" and not config.has_deepseek():
@@ -177,7 +225,11 @@ def main(
         base_name = input_p.stem
 
     # Determine model names for filenames
-    if whisper_model:
+    if whisper == "whisper-cli" and whisper_model:
+        # Model is a ggml file path; use its basename without extension
+        # (e.g. /models/ggml-large-v3.bin -> ggml-large-v3)
+        whisper_model_name = Path(whisper_model).stem
+    elif whisper_model:
         whisper_model_name = whisper_model.replace("/", "-")
     elif whisper == "openai":
         whisper_model_name = "whisper-1"
@@ -190,11 +242,15 @@ def main(
     if llm == "openai":
         llm_model_name = openai_model
     elif llm == "openrouter":
-        llm_model_name = openrouter_model.replace("/", "-")
+        llm_model_name = openrouter_model
     elif llm == "ollama":
         llm_model_name = ollama_model
     else:
         llm_model_name = llm  # deepseek
+    # Model names may contain path separators (e.g. "google/gemma-3-4b" from
+    # OpenAI-compatible endpoints, or "anthropic/claude-3.5-sonnet"); sanitize
+    # so they're safe to embed in output filenames.
+    llm_model_name = llm_model_name.replace("/", "-")
 
     # Default output paths with model names
     if output is None:
@@ -249,6 +305,7 @@ def main(
                 provider=whisper,
                 language=source_lang,
                 model=whisper_model,
+                vad_model=vad_model,
                 on_progress=on_transcribe_progress,
             )
             click.echo(f"  Transcribed {len(subtitles)} segments")
@@ -308,6 +365,10 @@ def main(
         llm_args = f"--llm {llm}"
         if llm == "openai":
             llm_args += f" --openai-model {openai_model}"
+            if openai_base_url:
+                llm_args += f" --openai-base-url {openai_base_url}"
+            if openai_extra_body:
+                llm_args += f" --openai-extra-body '{openai_extra_body}'"
         elif llm == "openrouter":
             llm_args += f" --openrouter-model {openrouter_model}"
         elif llm == "ollama":
@@ -321,8 +382,9 @@ def main(
             click.echo(f"Audio saved: {audio_path}")
             whisper_arg = f"--whisper {whisper}"
             whisper_model_arg = f" --whisper-model {whisper_model}" if whisper_model else ""
+            vad_model_arg = f" --vad-model {vad_model}" if vad_model else ""
             boost_arg = f" --boost {boost}" if boost else ""
-            click.echo(f"Retry from audio: autotranslate {audio_path} --audio --from {source_lang} --to {target_lang} {whisper_arg}{whisper_model_arg}{boost_arg} {llm_args}")
+            click.echo(f"Retry from audio: autotranslate {audio_path} --audio --from {source_lang} --to {target_lang} {whisper_arg}{whisper_model_arg}{vad_model_arg}{boost_arg} {llm_args}")
 
         sys.exit(1)
 
